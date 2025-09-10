@@ -28,6 +28,10 @@ const KIS_BASE = process.env.KIS_BASE || "https://openapi.koreainvestment.com:94
 const KIS_APP_KEY = must(process.env.KIS_APP_KEY, "KIS_APP_KEY");
 const KIS_APP_SECRET = must(process.env.KIS_APP_SECRET, "KIS_APP_SECRET");
 
+// optional: 업스트림에서 투자자별 수급을 조회할 경로(경로만, KIS_BASE 뒤에 붙음)
+// 예: /uapi/domestic-stock/v1/quotations/inquire-investor
+const KIS_FLOW_PATH = process.env.KIS_FLOW_PATH || "";
+
 // ── 유틸: 타임아웃 있는 fetch ─────────────────────────────────
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
   const controller = new AbortController();
@@ -129,14 +133,25 @@ app.get("/kis/token", async (_req, res) => {
   }
 });
 
-// ── helpers ────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────
 function pick(obj, keys) {
   const out = {};
   for (const k of keys) if (obj[k] !== undefined) out[k] = obj[k];
   return out;
 }
 
-// ── 현재가 조회 (국내주식) READ-ONLY ───────────────────────────
+// parse numeric-ish value (string or number) to Number or 0
+function toNum(v) {
+  if (v === null || v === undefined || v === "") return 0;
+  if (typeof v === "number") return Number(v);
+  if (typeof v === "string") {
+    const n = Number(v.replaceAll(",", "").trim());
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+// ── 기존 /kis/price 라우트 (변경 없음) ─────────────────────────
 app.get("/kis/price", async (req, res) => {
   const symbol = (req.query.symbol || "").toString().trim();
   const full = req.query.full === "1";                      // ?full=1 → 원본(디버그용)
@@ -203,6 +218,198 @@ app.get("/kis/price", async (req, res) => {
     res.setHeader("Cache-Control", "no-store"); // 실시간성
     res.type("application/json").send(body);
   } catch (e) {
+    const msg = e?.name === "AbortError" ? "timeout" : "internal";
+    res.status(502).json({ ok: false, error: msg });
+  }
+});
+
+// ── NEW: 특정일(YYYY-MM-DD) 외인/기관 수급 조회 ─────────────────
+/**
+ * GET /kis/flow?symbol=005930&date=2025-09-09
+ *
+ * 기본 동작:
+ *  - symbol: 6-digit KRX code (필수)
+ *  - date: YYYY-MM-DD (필수)
+ * 
+ * 업스트림 경로:
+ *  - 우선 process.env.KIS_FLOW_PATH 사용 (경로만, KIS_BASE 뒤에 붙임)
+ *  - 없으면 CANDIDATE_PATHS 중 시도
+ * 
+ * 응답: { ok: true, symbol, date, flows: { foreign, institution, retail }, rawCount }
+ */
+function isValidDateString(d) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(d) && !Number.isNaN(new Date(d).getTime());
+}
+
+// 유연한 응답 파싱: 다양한 upstream 스키마를 허용하여 외인/기관 순매수 계산
+function parseInvestorResponse(json) {
+  // 가능한 패턴을 탐색하고 숫자형으로 변환하여 누적
+  const out = { foreign: 0, institution: 0, retail: 0 };
+
+  // helper: try common keys
+  const tryKeyPair = (obj, buyKey, sellKey, target) => {
+    if (!obj) return false;
+    const b = toNum(obj[buyKey]);
+    const s = toNum(obj[sellKey]);
+    if (b || s) { out[target] += (b - s); return true; }
+    return false;
+  };
+
+  // 1) flat fields like foreign_buy / foreign_sell or foreignBuy / foreignSell
+  tryKeyPair(json, "foreign_buy", "foreign_sell", "foreign") ||
+  tryKeyPair(json, "foreignBuy", "foreignSell", "foreign");
+  tryKeyPair(json, "inst_buy", "inst_sell", "institution") ||
+  tryKeyPair(json, "instBuy", "instSell", "institution");
+  tryKeyPair(json, "retail_buy", "retail_sell", "retail") ||
+  tryKeyPair(json, "retailBuy", "retailSell", "retail");
+
+  // 2) nested output object (common in KIS responses)
+  const possibleContainers = [json.output, json.data, json.result, json.body, json.response];
+  for (const c of possibleContainers) {
+    if (!c) continue;
+    tryKeyPair(c, "frgn_nt", "frgn_sell", "foreign") // custom
+    tryKeyPair(c, "frgn_buy", "frgn_sell", "foreign")
+    tryKeyPair(c, "foreign_buy", "foreign_sell", "foreign")
+    tryKeyPair(c, "foreignBuy", "foreignSell", "foreign")
+    tryKeyPair(c, "inst_buy", "inst_sell", "institution")
+    tryKeyPair(c, "instBuy", "instSell", "institution")
+    tryKeyPair(c, "foreigner_buy", "foreigner_sell", "foreign")
+    // KIS sometimes returns arrays: investorSummary or list
+    if (Array.isArray(c.investor) || Array.isArray(c.investorSummary) || Array.isArray(c.list)) {
+      const arr = c.investor || c.investorSummary || c.list;
+      for (const it of arr) {
+        const role = (it.type || it.investorType || it.category || it.name || "").toString().toLowerCase();
+        const buy = toNum(it.buy || it.buy_amt || it.bsBuy || it.bs_buy || it.bp_buy);
+        const sell = toNum(it.sell || it.sell_amt || it.bsSell || it.bs_sell || it.bp_sell);
+        if (role.includes("foreign") || role.includes("외") || role.includes("foreigners") || role.includes("frgn")) out.foreign += (buy - sell);
+        else if (role.includes("inst") || role.includes("institution") || role.includes("기관")) out.institution += (buy - sell);
+        else if (role.includes("retail") || role.includes("개인") || role.includes("ret")) out.retail += (buy - sell);
+      }
+    }
+  }
+
+  // 3) if top-level has arrays like trades: try to aggregate by investorType field
+  if (Array.isArray(json.trades) || Array.isArray(json.items) || Array.isArray(json.records)) {
+    const arr = json.trades || json.items || json.records;
+    for (const t of arr) {
+      const investor = (t.investorType || t.type || t.accType || t.owner || "").toString().toLowerCase();
+      const buy = toNum(t.buy || t.buyAmt || t.bp_buy || t.bsBuy || t.buy_amount);
+      const sell = toNum(t.sell || t.sellAmt || t.bp_sell || t.bsSell || t.sell_amount);
+      if (investor.includes("foreign") || investor.includes("frgn") || investor.includes("외")) out.foreign += (buy - sell);
+      else if (investor.includes("inst") || investor.includes("institution") || investor.includes("기관")) out.institution += (buy - sell);
+      else out.retail += (buy - sell);
+    }
+  }
+
+  return out;
+}
+
+// candidate paths (relative to KIS_BASE) to try when KIS_FLOW_PATH not provided.
+// These are best-effort guesses; real path may vary per vendor/account.
+const CANDIDATE_PATHS = [
+  "/uapi/domestic-stock/v1/quotations/inquire-investor",   // plausible
+  "/uapi/domestic-stock/v1/quotations/inquire-investor-volume",
+  "/uapi/domestic-stock/v1/quotations/inquire-investor-trend",
+  "/uapi/domestic-stock/v1/quotations/inquire-trades"      // generic trades
+];
+
+app.get("/kis/flow", async (req, res) => {
+  const symbol = (req.query.symbol || "").toString().trim();
+  const date = (req.query.date || "").toString().trim(); // expect YYYY-MM-DD
+
+  if (!/^\d{6}$/.test(symbol)) {
+    return res.status(400).json({ ok: false, error: "invalid_symbol", hint: "use 6-digit KRX code, e.g., 005930" });
+  }
+  if (!isValidDateString(date)) {
+    return res.status(400).json({ ok: false, error: "invalid_date", hint: "use YYYY-MM-DD" });
+  }
+
+  try {
+    const ACCESS_TOKEN = await getPaperToken();
+    const baseHeaders = {
+      authorization: `Bearer ${ACCESS_TOKEN}`,
+      appkey: KIS_APP_KEY,
+      appsecret: KIS_APP_SECRET,
+      Accept: "application/json",
+    };
+
+    // build candidate URLs: prefer env-configured path first
+    const candidates = [];
+    if (KIS_FLOW_PATH) {
+      candidates.push(`${KIS_BASE}${KIS_FLOW_PATH}`);
+    }
+    for (const p of CANDIDATE_PATHS) candidates.push(`${KIS_BASE}${p}`);
+
+    let lastErr = null;
+    let parsedFlows = null;
+    let rawJson = null;
+    let usedUrl = null;
+
+    // try each candidate until we get a 200 with JSON we can parse
+    for (const urlBase of candidates) {
+      // many upstream APIs use YYYYMMDD (no '-') for date params — try both
+      const dateNoDash = date.replaceAll("-", "");
+      // try two common param sets
+      const tryParamsList = [
+        { FID_INPUT_ISCD: symbol, FID_INPUT_DATE: dateNoDash }, // generic KIS style
+        { symbol, date: dateNoDash },
+        { symbol, date }, // with dash
+        { FID_COND_MRKT_DIV_CODE: "J", FID_INPUT_ISCD: symbol, FID_INPUT_YYYYMMDD: dateNoDash },
+        { FID_COND_MRKT_DIV_CODE: "J", FID_INPUT_ISCD: symbol, FID_INPUT_DATE: dateNoDash },
+        { FID_COND_MRKT_DIV_CODE: "J", FID_INPUT_ISCD: symbol, FID_INPUT_DATE: date }
+      ];
+
+      let ok = false;
+      for (const params of tryParamsList) {
+        const url = urlBase + "?" + new URLSearchParams(params).toString();
+        usedUrl = url;
+        try {
+          const resp = await fetchWithTimeout(url, { headers: baseHeaders }, 10_000);
+          const j = await resp.json().catch(() => null);
+          if (!resp.ok) {
+            lastErr = `upstream ${resp.status} ${resp.statusText} @ ${url} ${safeDetail(j)}`;
+            continue;
+          }
+          if (!j) { lastErr = `empty_json @ ${url}`; continue; }
+          // parse investor info
+          rawJson = j;
+          parsedFlows = parseInvestorResponse(j);
+          ok = true;
+          break;
+        } catch (e) {
+          lastErr = `fetch_err @ ${url} : ${String(e)}`;
+        }
+      }
+      if (ok) break;
+    }
+
+    if (!parsedFlows) {
+      // couldn't parse from any upstream — return 502 with diagnostic
+      return res.status(502).json({
+        ok: false,
+        error: "upstream_no_flow_data",
+        detail: lastErr,
+        triedUrl: usedUrl,
+      });
+    }
+
+    // respond with aggregated flows
+    const flows = {
+      foreign: Math.round(parsedFlows.foreign),
+      institution: Math.round(parsedFlows.institution),
+      retail: Math.round(parsedFlows.retail),
+    };
+
+    res.json({
+      ok: true,
+      symbol,
+      date,
+      flows,
+      rawCount: Array.isArray(rawJson?.trades || rawJson?.items) ? (rawJson.trades || rawJson.items).length : undefined,
+      _debug_used_url: usedUrl, // debug 필드 (필요시 제거)
+    });
+  } catch (e) {
+    console.error("flow_err:", safeDetail(e?.message ?? e));
     const msg = e?.name === "AbortError" ? "timeout" : "internal";
     res.status(502).json({ ok: false, error: msg });
   }
