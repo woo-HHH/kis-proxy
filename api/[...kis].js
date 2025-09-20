@@ -20,15 +20,31 @@ return new Response(text, { status: r.status, headers: { 'content-type': 'applic
 
 
 module.exports = async (req, res) => {
-if (req.method === 'OPTIONS') { headersCORS(res); return res.status(204).end(); }
-headersCORS(res);
+  if (req.method === 'OPTIONS') { headersCORS(res); return res.status(204).end(); }
+  headersCORS(res);
+
+  // 1) 경로 파싱 (Vercel에선 req.url이 상대일 수 있어 base 필요)
+  const url = new URL(req.url, 'http://local');
+  const pathname = url.pathname.replace(/^\/api\/?/, '');
+
+  // 2) 헬스체크는 인증 없이 OK
+  if (pathname === 'health') {
+    return res.status(200).send('ok');
+  }
+
+  // 3) 나머지는 API Key 필수
+  const apiKey = req.headers['x-api-key'] || '';
+  if (!process.env.PROXY_API_KEY || apiKey !== process.env.PROXY_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // 4) 이후 price / investor / balance 라우팅 분기 …
+  // if (pathname === 'price') { ... }
+  // if (pathname === 'investor') { ... }
+  // if (pathname === 'balance') { ... }
+};
 
 
-try {
-const apiKey = req.headers['x-api-key'];
-if (!process.env.PROXY_API_KEY || apiKey !== process.env.PROXY_API_KEY) {
-return res.status(401).json({ error: 'Unauthorized' });
-}
 
 
 // path routing: /api/price, /api/investor, /api/balance
