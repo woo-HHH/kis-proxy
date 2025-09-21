@@ -98,6 +98,34 @@ async function kisGET(u, trid) {
   return { status: r.status, body };
 }
 
+// 재귀 탐색: 객체 내부에서 키를 찾아 첫 번째 값 반환
+function findField(obj, key) {
+  if (obj == null) return undefined;
+  if (typeof obj !== 'object') return undefined;
+  if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (v && typeof v === 'object') {
+      const found = findField(v, key);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+
+// 날짜 포맷 YYYYMMDD 생성 (UTC 기준으로 단순 역산)
+function makeDates(days) {
+  const dates = [];
+  const now = new Date();
+  for (let i = 0; i < days; i++) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    d.setUTCDate(d.getUTCDate() - i);
+    const s = d.toISOString().slice(0,10).replace(/-/g,''); // YYYYMMDD
+    dates.push(s);
+  }
+  return dates;
+}
+
 module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') { headersCORS(res); return res.status(204).end(); }
   headersCORS(res);
@@ -125,6 +153,47 @@ module.exports = async (req, res) => {
       const u = `${BASE}${PATH.PRICE}?${toQS({ FID_COND_MRKT_DIV_CODE: mkt, FID_INPUT_ISCD: code })}`;
       const { status, body } = await kisGET(u, TRID.PRICE);
       return res.status(status).send(body);
+    }
+
+    // --- New: series endpoint for extracting a field across recent days
+    // Usage: /api/series?code=005930&days=5&field=frgn_shnu_vol
+    if (pathname === 'series') {
+      const code = url.searchParams.get('code') || '';
+      const days = Math.min( Number(url.searchParams.get('days') || 5) || 5, 60 ); // max 60 to avoid long loops
+      const field = url.searchParams.get('field') || 'frgn_shnu_vol';
+
+      if (!code) return res.status(400).json({ error: 'code is required' });
+
+      const dates = makeDates(days);
+      const out = [];
+
+      for (const d of dates) {
+        const u = `${BASE}${PATH.INVEST}?${toQS({
+          FID_COND_MRKT_DIV_CODE: 'J',
+          FID_INPUT_ISCD: code,
+          FID_INPUT_DATE_1: d,
+          FID_ORG_ADJ_PRC: '',
+          FID_ETC_CLS_CODE: '',
+        })}`;
+
+        // upstream 요청
+        const { status, body } = await kisGET(u, TRID.INVEST);
+
+        // 로그 남기기(디버그 목적). 필요 없으면 제거하세요.
+        try {
+          console.log('SERIES_UPSTREAM_URL', u);
+          console.log('SERIES_UPSTREAM_STATUS', status);
+        } catch (e) { /* ignore */ }
+
+        let parsed = null;
+        try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = null; }
+
+        const value = parsed ? findField(parsed, field) : undefined;
+
+        out.push({ date: d, status, value: (value !== undefined ? value : null) });
+      }
+
+      return res.status(200).json({ code, field, series: out });
     }
 
     if (pathname === 'investor') {
