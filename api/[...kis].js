@@ -149,7 +149,7 @@ if (pathname === 'series') {
 
   if (!code) return res.status(400).json({ error: 'code is required' });
 
-  // 필드 별칭 지원
+  // 약어 별칭 지원
   const FIELD_ALIAS = {
     fb: 'frgn_shnu_vol',          // 외인매수량
     fs: 'frgn_seln_vol',          // 외인매도량
@@ -160,43 +160,34 @@ if (pathname === 'series') {
   };
   const field = FIELD_ALIAS[fieldRaw.toLowerCase()] || fieldRaw;
 
-  // 견고한 필드 탐색기 (대소문자 무시, 배열/중첩 재귀, 숫자 문자열 변환)
+  // 견고한 필드 탐색기 (대소문자 무시, 배열/중첩 탐색, 숫자 문자열 변환)
   function findFieldRobust(obj, key) {
     if (obj == null) return undefined;
-    const target = (key || '').toString().toLowerCase();
+    const target = String(key).toLowerCase();
     const seen = new Set();
     function dfs(x) {
-      if (x == null || typeof x !== 'object') return undefined;
-      if (seen.has(x)) return undefined;
+      if (!x || typeof x !== 'object' || seen.has(x)) return undefined;
       seen.add(x);
 
-      // 1) 직접 키 매칭 (대소문자 무시)
       for (const k of Object.keys(x)) {
         if (k.toLowerCase() === target) return x[k];
       }
-      // 2) 배열 요소 탐색
       if (Array.isArray(x)) {
         for (const el of x) {
-          if (el && typeof el === 'object') {
-            const f = dfs(el);
-            if (f !== undefined) return f;
-          }
-        }
-      }
-      // 3) 하위 객체 재귀
-      for (const k of Object.keys(x)) {
-        const v = x[k];
-        if (v && typeof v === 'object') {
-          const f = dfs(v);
+          const f = dfs(el);
           if (f !== undefined) return f;
         }
+      }
+      for (const k of Object.keys(x)) {
+        const f = dfs(x[k]);
+        if (f !== undefined) return f;
       }
       return undefined;
     }
     return dfs(obj);
   }
 
-  // YYYYMMDD 리스트
+  // YYYYMMDD 리스트 (오늘부터 역순)
   const dates = makeDates(days);
   const out = [];
 
@@ -208,7 +199,6 @@ if (pathname === 'series') {
     let finalValue = null;
 
     while (attempts < 7) {
-      // 1) 업스트림 호출
       const u = `${BASE}${PATH.INVEST}?${toQS({
         FID_COND_MRKT_DIV_CODE: 'J',
         FID_INPUT_ISCD: code,
@@ -217,51 +207,25 @@ if (pathname === 'series') {
         FID_ETC_CLS_CODE: '',
       })}`;
 
-      let status = 0;
-      let body = '';
+      const { status, body } = await kisGET(u, TRID.INVEST);
+      finalStatus = status;
 
-      try {
-        const r = await kisGET(u, TRID.INVEST);
-        status = r.status;
-        body = r.body || '';
-        finalStatus = status;
-      } catch (e) {
-        console.error('SERIES_FETCH_ERROR', e && e.message ? e.message : e);
-        // 실패 시 이전 날짜로 이동
-        const y = Number(attemptDate.slice(0, 4));
-        const m = Number(attemptDate.slice(4, 6)) - 1;
-        const d = Number(attemptDate.slice(6, 8));
-        const prev = new Date(Date.UTC(y, m, d));
-        prev.setUTCDate(prev.getUTCDate() - 1);
-        attemptDate = prev.toISOString().slice(0, 10).replace(/-/g, '');
-        attempts++;
-        continue;
-      }
+      // (필요 시) 디버그 로그 — 문제 해결 후 제거 권장
+      console.log('SERIES_UPSTREAM_URL', u);
+      console.log('SERIES_UPSTREAM_STATUS', status);
+      console.log('SERIES_UPSTREAM_BODY', (body && body.slice) ? body.slice(0, 2000) : body);
 
-      // 디버그 로그 (확인 후 제거 권장)
-      try {
-        console.log('SERIES_UPSTREAM_URL', u);
-        console.log('SERIES_UPSTREAM_STATUS', status);
-        console.log('SERIES_UPSTREAM_BODY', body.slice ? body.slice(0, 2000) : body);
-      } catch (e) {
-        // console.log 실패는 무시
-      }
-
-      // 2) 파싱
+      // 파싱 (예외만 try-catch)
       let parsed = null;
-      try {
-        parsed = JSON.parse(body || '{}');
-      } catch (e) {
-        parsed = null;
-      }
+      try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = null; }
 
-      // KIS 비거래일/데이터 없음 시 자주 오는 패턴
+      // 비거래일/데이터 없음 패턴
       const looksEmpty =
         parsed && typeof parsed === 'object' &&
         Object.keys(parsed).length === 3 &&
         parsed.rt_cd === '' && parsed.msg_cd === '' && parsed.msg1 === '';
 
-      // 3) 값 추출
+      // 값 추출
       let value = null;
       if (!looksEmpty && parsed) {
         value = findFieldRobust(parsed, field);
@@ -276,7 +240,7 @@ if (pathname === 'series') {
         break; // 성공
       }
 
-      // 4) 실패 → 이전 날짜로 -1일
+      // 실패 → 이전 날짜로 -1일
       const y = Number(attemptDate.slice(0, 4));
       const m = Number(attemptDate.slice(4, 6)) - 1;
       const d = Number(attemptDate.slice(6, 8));
