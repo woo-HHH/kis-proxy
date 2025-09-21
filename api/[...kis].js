@@ -129,7 +129,10 @@ module.exports = async (req, res) => {
 
     if (pathname === 'investor') {
       const code = url.searchParams.get('code') || '';
-      const date = url.searchParams.get('date') || '';
+      // 날짜 포맷 정규화: 허용되는 형식(YYYYMMDD)으로 자동 변환
+      const rawDate = url.searchParams.get('date') || '';
+      const date = rawDate.replace(/-/g, '');
+
       const u = `${BASE}${PATH.INVEST}?${toQS({
         FID_COND_MRKT_DIV_CODE: 'J',
         FID_INPUT_ISCD: code,
@@ -137,7 +140,19 @@ module.exports = async (req, res) => {
         FID_ORG_ADJ_PRC: '',
         FID_ETC_CLS_CODE: '',
       })}`;
+
       const { status, body } = await kisGET(u, TRID.INVEST);
+
+      // --- Debug logs: 업스트림 URL / 상태 / 바디 일부를 남깁니다.
+      // 나중에 문제 해결되면 이 로그는 제거하세요 (민감정보 노출 주의)
+      try {
+        console.log('INVEST_UPSTREAM_URL', u);
+        console.log('INVEST_UPSTREAM_STATUS', status);
+        console.log('INVEST_UPSTREAM_BODY', (body && body.slice) ? body.slice(0, 1000) : body);
+      } catch (e) {
+        console.error('INVEST_LOG_ERROR', e && e.message ? e.message : e);
+      }
+
       return res.status(status).send(body);
     }
 
