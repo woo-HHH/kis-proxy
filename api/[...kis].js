@@ -149,7 +149,7 @@ if (pathname === 'series') {
 
   if (!code) return res.status(400).json({ error: 'code is required' });
 
-  // 필드 별칭 지원 (요청하신 fb/fs/fnb/ob/os/onb 단축키)
+  // 필드 별칭 지원
   const FIELD_ALIAS = {
     fb: 'frgn_shnu_vol',          // 외인매수량
     fs: 'frgn_seln_vol',          // 외인매도량
@@ -208,6 +208,7 @@ if (pathname === 'series') {
     let finalValue = null;
 
     while (attempts < 7) {
+      // 1) 업스트림 호출
       const u = `${BASE}${PATH.INVEST}?${toQS({
         FID_COND_MRKT_DIV_CODE: 'J',
         FID_INPUT_ISCD: code,
@@ -216,26 +217,51 @@ if (pathname === 'series') {
         FID_ETC_CLS_CODE: '',
       })}`;
 
-      const { status, body } = await kisGET(u, TRID.INVEST);
-      finalStatus = status;
+      let status = 0;
+      let body = '';
+
+      try {
+        const r = await kisGET(u, TRID.INVEST);
+        status = r.status;
+        body = r.body || '';
+        finalStatus = status;
+      } catch (e) {
+        console.error('SERIES_FETCH_ERROR', e && e.message ? e.message : e);
+        // 실패 시 이전 날짜로 이동
+        const y = Number(attemptDate.slice(0, 4));
+        const m = Number(attemptDate.slice(4, 6)) - 1;
+        const d = Number(attemptDate.slice(6, 8));
+        const prev = new Date(Date.UTC(y, m, d));
+        prev.setUTCDate(prev.getUTCDate() - 1);
+        attemptDate = prev.toISOString().slice(0, 10).replace(/-/g, '');
+        attempts++;
+        continue;
+      }
 
       // 디버그 로그 (확인 후 제거 권장)
       try {
         console.log('SERIES_UPSTREAM_URL', u);
         console.log('SERIES_UPSTREAM_STATUS', status);
-        console.log('SERIES_UPSTREAM_BODY', (body && body.slice) ? body.slice(0, 2000) : body);
-      } catch {}
+        console.log('SERIES_UPSTREAM_BODY', body.slice ? body.slice(0, 2000) : body);
+      } catch (e) {
+        // console.log 실패는 무시
+      }
 
+      // 2) 파싱
       let parsed = null;
-      try { parsed = JSON.parse(body || '{}'); } catch { parsed = null; }
+      try {
+        parsed = JSON.parse(body || '{}');
+      } catch (e) {
+        parsed = null;
+      }
 
-      // KIS가 비거래일/데이터 없음일 때 종종 오는 패턴
+      // KIS 비거래일/데이터 없음 시 자주 오는 패턴
       const looksEmpty =
         parsed && typeof parsed === 'object' &&
         Object.keys(parsed).length === 3 &&
         parsed.rt_cd === '' && parsed.msg_cd === '' && parsed.msg1 === '';
 
-      // 값 추출
+      // 3) 값 추출
       let value = null;
       if (!looksEmpty && parsed) {
         value = findFieldRobust(parsed, field);
@@ -250,13 +276,13 @@ if (pathname === 'series') {
         break; // 성공
       }
 
-      // 실패 → 이전 날짜로 -1일
+      // 4) 실패 → 이전 날짜로 -1일
       const y = Number(attemptDate.slice(0, 4));
       const m = Number(attemptDate.slice(4, 6)) - 1;
       const d = Number(attemptDate.slice(6, 8));
       const prev = new Date(Date.UTC(y, m, d));
       prev.setUTCDate(prev.getUTCDate() - 1);
-      attemptDate = prev.toISOString().slice(0, 10).replace(/-/g, ''); // YYYYMMDD
+      attemptDate = prev.toISOString().slice(0, 10).replace(/-/g, '');
 
       attempts++;
     }
