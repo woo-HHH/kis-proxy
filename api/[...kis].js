@@ -167,6 +167,29 @@ module.exports = async (req, res) => {
       return res.status(status).send(body);
     }
 
+// --- investor_raw: KIS 응답 원문을 그대로 반환(디버그용)
+if (pathname === 'investor_raw') {
+  const code = (url.searchParams.get('code') || '').trim();
+  const date = (url.searchParams.get('date') || '').replace(/-/g,'').trim();
+  if (!code) return res.status(400).json({ error: 'code is required' });
+  const ymd = date || todaySeoulYMD();
+
+  const qs = toQS({
+    FID_COND_MRKT_DIV_CODE: 'J',
+    FID_INPUT_ISCD: code,
+    FID_INPUT_DATE_1: ymd,
+    FID_ORG_ADJ_PRC: '',
+    FID_ETC_CLS_CODE: '',
+  });
+  const u = `${BASE}${PATH.INVEST}?${qs}`;
+
+  const { status, body } = await kisGET(u, TRID.INVEST);
+
+  // Apps Script와 더 비슷하게 UA/Accept 등 헤더를 추가하고 싶다면 kisGET 내부에서 확장해도 OK
+  return res.status(status).send(body);
+}
+
+
     // --- series endpoint (Apps Script style): 한 번 호출 → 배열에서 상위 N개 추출
     // Usage: /api/series?code=005930&days=5&field=frgn_shnu_vol[&date=YYYYMMDD][&debug=1]
     if (pathname === 'series') {
