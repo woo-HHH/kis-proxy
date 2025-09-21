@@ -327,3 +327,74 @@ if (pathname === 'investor_raw') {
     return res.status(502).json({ error: String(e && e.message ? e.message : e) });
   }
 };
+
+/*** Web API 엔드포인트 (웹앱) ***/
+/** 호출 예:
+ *  https://script.google.com/macros/s/DEPLOY_ID/exec?op=series&code=005930&days=5&field=fb&key=YOUR_KEY
+ *  field 별칭: fb=외인매수량, fs=외인매도량, fnb=외인순매수금, ob=기관매수량, os=기관매도량, onb=기관순매수금
+ */
+function doGet(e) {
+  try {
+    const p = e && e.parameter ? e.parameter : {};
+    const op = (p.op || 'series').trim();            // 현재는 series만 지원
+    const code = String(p.code || '').replace(/\D/g,'').padStart(6,'0');
+    const days = Math.min(Math.max(1, parseInt(p.days || '5', 10) || 5), 60);
+    const fieldRaw = (p.field || 'frgn_shnu_vol').trim();
+    const apiKey = (p.key || '').trim();
+
+    // 간단 키 체크(선택) — 원하시면 스크립트 속성에 저장한 키와 비교하도록 바꿔도 됩니다.
+    var EXPECTED = 'heowoocheon'; // 필요 시 PropertiesService.getScriptProperties().getProperty('PROXY_API_KEY')
+    if (EXPECTED && apiKey !== EXPECTED) {
+      return _json_({ error: 'Unauthorized' }, 401);
+    }
+
+    if (!code || code === '000000') return _json_({ error: 'code is required' }, 400);
+
+    // field 별칭
+    const FIELD_ALIAS = {
+      fb: 'frgn_shnu_vol',
+      fs: 'frgn_seln_vol',
+      fnb: 'frgn_ntby_tr_pbmn',
+      ob: 'orgn_shnu_vol',
+      os: 'orgn_seln_vol',
+      onb: 'orgn_ntby_tr_pbmn',
+    };
+    const field = FIELD_ALIAS[String(fieldRaw).toLowerCase()] || fieldRaw;
+
+    if (op === 'series') {
+      // 오늘(서울) 기준일
+      var base = Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyyMMdd');
+      // KIS에서 해당 기준일 데이터 없을 수 있으니 _fetchInvestorDaily_가 알아서 7일 이내 보정
+      var inv = _fetchInvestorDaily_(code, base) || {};
+      var rows = Array.isArray(inv.output2) ? inv.output2.slice() : [];
+      rows.sort(function(a,b){ return String(b.stck_bsop_date||'').localeCompare(String(a.stck_bsop_date||'')); });
+      var cut = rows.slice(0, days);
+
+      // 숫자 변환
+      var toNum = function(v) {
+        var s = (v == null ? '' : String(v)).replace(/[, ]+/g,'');
+        var n = Number(s);
+        return isFinite(n) ? n : null;
+      };
+
+      var series = cut.map(function(r){
+        var date = String(r && r.stck_bsop_date || '');
+        var val  = r ? r[field] : null;
+        return { date: date, status: 200, value: toNum(val) };
+      });
+
+      return _json_({ code: code, field: field, series: series, base_ymd: inv._base_ymd || base });
+    }
+
+    return _json_({ error: 'Not Found' }, 404);
+  } catch (err) {
+    return _json_({ error: String(err && err.message ? err.message : err) }, 502);
+  }
+}
+
+/** JSON 응답 유틸 */
+function _json_(obj, status) {
+  var out = ContentService.createTextOutput(JSON.stringify(obj));
+  out.setMimeType(ContentService.MimeType.JSON);
+  return out; // Apps Script는 상태코드 커스터마이즈가 제한됨(기본 200). 필요시 HTMLService로 우회 가능.
+}
