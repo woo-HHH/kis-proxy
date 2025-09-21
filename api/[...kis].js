@@ -140,12 +140,133 @@ module.exports = async (req, res) => {
       return res.status(status).send(body);
     }
 
-    // --- series endpoint for extracting a field across recent days
-    // Usage: /api/series?code=005930&days=5&field=frgn_shnu_vol
-    if (pathname === 'series') {
-      const code = url.searchParams.get('code') || '';
-      const days = Math.min( Number(url.searchParams.get('days') || 5) || 5, 60 ); // max 60 to avoid long loops
-      const field = url.searchParams.get('field') || 'frgn_shnu_vol';
+// --- series endpoint for extracting a field across recent days
+// Usage: /api/series?code=005930&days=5&field=frgn_shnu_vol
+if (pathname === 'series') {
+  const code = url.searchParams.get('code') || '';
+  const days = Math.min(Number(url.searchParams.get('days') || 5) || 5, 60); // max 60
+  const fieldRaw = (url.searchParams.get('field') || 'frgn_shnu_vol').trim();
+
+  if (!code) return res.status(400).json({ error: 'code is required' });
+
+  // 필드 별칭 지원 (요청하신 fb/fs/fnb/ob/os/onb 단축키)
+  const FIELD_ALIAS = {
+    fb: 'frgn_shnu_vol',          // 외인매수량
+    fs: 'frgn_seln_vol',          // 외인매도량
+    fnb: 'frgn_ntby_tr_pbmn',     // 외인순매수금(대금)
+    ob: 'orgn_shnu_vol',          // 기관매수량
+    os: 'orgn_seln_vol',          // 기관매도량
+    onb: 'orgn_ntby_tr_pbmn',     // 기관순매수금(대금)
+  };
+  const field = FIELD_ALIAS[fieldRaw.toLowerCase()] || fieldRaw;
+
+  // 견고한 필드 탐색기 (대소문자 무시, 배열/중첩 재귀, 숫자 문자열 변환)
+  function findFieldRobust(obj, key) {
+    if (obj == null) return undefined;
+    const target = (key || '').toString().toLowerCase();
+    const seen = new Set();
+    function dfs(x) {
+      if (x == null || typeof x !== 'object') return undefined;
+      if (seen.has(x)) return undefined;
+      seen.add(x);
+
+      // 1) 직접 키 매칭 (대소문자 무시)
+      for (const k of Object.keys(x)) {
+        if (k.toLowerCase() === target) return x[k];
+      }
+      // 2) 배열 요소 탐색
+      if (Array.isArray(x)) {
+        for (const el of x) {
+          if (el && typeof el === 'object') {
+            const f = dfs(el);
+            if (f !== undefined) return f;
+          }
+        }
+      }
+      // 3) 하위 객체 재귀
+      for (const k of Object.keys(x)) {
+        const v = x[k];
+        if (v && typeof v === 'object') {
+          const f = dfs(v);
+          if (f !== undefined) return f;
+        }
+      }
+      return undefined;
+    }
+    return dfs(obj);
+  }
+
+  // YYYYMMDD 리스트
+  const dates = makeDates(days);
+  const out = [];
+
+  for (const d0 of dates) {
+    // d0부터 시작 → 빈 응답이면 최대 7일 이전으로 보정(주말/휴일 스킵)
+    let attemptDate = d0;
+    let attempts = 0;
+    let finalStatus = 0;
+    let finalValue = null;
+
+    while (attempts < 7) {
+      const u = `${BASE}${PATH.INVEST}?${toQS({
+        FID_COND_MRKT_DIV_CODE: 'J',
+        FID_INPUT_ISCD: code,
+        FID_INPUT_DATE_1: attemptDate,
+        FID_ORG_ADJ_PRC: '',
+        FID_ETC_CLS_CODE: '',
+      })}`;
+
+      const { status, body } = await kisGET(u, TRID.INVEST);
+      finalStatus = status;
+
+      // 디버그 로그 (확인 후 제거 권장)
+      try {
+        console.log('SERIES_UPSTREAM_URL', u);
+        console.log('SERIES_UPSTREAM_STATUS', status);
+        console.log('SERIES_UPSTREAM_BODY', (body && body.slice) ? body.slice(0, 2000) : body);
+      } catch {}
+
+      let parsed = null;
+      try { parsed = JSON.parse(body || '{}'); } catch { parsed = null; }
+
+      // KIS가 비거래일/데이터 없음일 때 종종 오는 패턴
+      const looksEmpty =
+        parsed && typeof parsed === 'object' &&
+        Object.keys(parsed).length === 3 &&
+        parsed.rt_cd === '' && parsed.msg_cd === '' && parsed.msg1 === '';
+
+      // 값 추출
+      let value = null;
+      if (!looksEmpty && parsed) {
+        value = findFieldRobust(parsed, field);
+        if (value != null && typeof value === 'string') {
+          const num = Number(value.replace(/[, ]+/g, ''));
+          if (!Number.isNaN(num)) value = num;
+        }
+      }
+
+      if (!looksEmpty && value != null) {
+        finalValue = value;
+        break; // 성공
+      }
+
+      // 실패 → 이전 날짜로 -1일
+      const y = Number(attemptDate.slice(0, 4));
+      const m = Number(attemptDate.slice(4, 6)) - 1;
+      const d = Number(attemptDate.slice(6, 8));
+      const prev = new Date(Date.UTC(y, m, d));
+      prev.setUTCDate(prev.getUTCDate() - 1);
+      attemptDate = prev.toISOString().slice(0, 10).replace(/-/g, ''); // YYYYMMDD
+
+      attempts++;
+    }
+
+    out.push({ date: d0, status: finalStatus, value: finalValue });
+  }
+
+  return res.status(200).json({ code, field, series: out });
+}
+
 
       if (!code) return res.status(400).json({ error: 'code is required' });
 
