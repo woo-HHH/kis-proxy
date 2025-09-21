@@ -1,252 +1,88 @@
-// api/[...kis].js
-// Vercel Serverless Function (Node.js) — KIS LIVE Proxy (stabilized)
+// --- New: series endpoint for extracting a field across recent days
+// Usage: /api/series?code=005930&days=5&field=frgn_shnu_vol
+if (pathname === 'series') {
+  const code = url.searchParams.get('code') || '';
+  const days = Math.min( Number(url.searchParams.get('days') || 5) || 5, 60 ); // max 60
+  const field = url.searchParams.get('field') || 'frgn_shnu_vol';
 
-const BASE = 'https://openapi.koreainvestment.com:9443';
-const PATH = {
-  TOKEN: '/oauth2/tokenP',
-  PRICE: '/uapi/domestic-stock/v1/quotations/inquire-price',
-  INVEST: '/uapi/domestic-stock/v1/quotations/investor-trade-by-stock-daily',
-  BAL: '/uapi/domestic-stock/v1/trading/inquire-balance',
-};
-const TRID = {
-  PRICE: 'FHKST01010100',
-  INVEST: 'FHPTJ04160001',
-  BAL: 'TTTC8434R',
-};
-const CUSTTYPE = 'P';
+  if (!code) return res.status(400).json({ error: 'code is required' });
 
-let cachedToken = null; // { token: string, exp: number(ms) }
+  // 강건한 필드 탐색기 (case-insensitive, 배열/중첩 재귀, 숫자화 시도)
+  function findFieldRobust(obj, key) {
+    if (obj == null) return undefined;
+    const target = (key || '').toString().toLowerCase();
+    const seen = new Set();
+    function dfs(x) {
+      if (x == null) return undefined;
+      if (typeof x !== 'object') return undefined;
+      if (seen.has(x)) return undefined;
+      seen.add(x);
 
-function ok(res) { return res.status >= 200 && res.status < 300; }
-function headersCORS(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-}
-function toQS(obj) {
-  return Object.entries(obj)
-    .filter(([, v]) => v != null && v !== '')
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-    .join('&');
-}
-function assertEnv() {
-  if (!process.env.KIS_APP_KEY || !process.env.KIS_APP_SECRET) {
-    throw new Error('Missing KIS_APP_KEY / KIS_APP_SECRET');
-  }
-  if (!process.env.PROXY_API_KEY) {
-    throw new Error('Missing PROXY_API_KEY');
-  }
-}
+      // direct case-insensitive key match
+      for (const k of Object.keys(x)) {
+        if (k.toLowerCase() === target) return x[k];
+      }
 
-async function getToken() {
-  const now = Date.now();
-  if (cachedToken && now < cachedToken.exp - 60_000) return cachedToken.token;
+      // if it's array-like, check array elements
+      if (Array.isArray(x)) {
+        for (const el of x) {
+          if (el && typeof el === 'object') {
+            const f = dfs(el);
+            if (f !== undefined) return f;
+          }
+        }
+      }
 
-  const body = JSON.stringify({
-    grant_type: 'client_credentials',
-    appkey: process.env.KIS_APP_KEY,
-    appsecret: process.env.KIS_APP_SECRET,
-  });
-
-  const r = await fetch(BASE + PATH.TOKEN, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json; charset=utf-8', accept: 'application/json' },
-    body,
-  });
-  const text = await r.text().catch(() => '');
-  if (!ok(r)) {
-    console.error('TOKEN_UPSTREAM_ERROR', r.status, text);
-    throw new Error(`TOKEN ${r.status}: ${text.slice(0, 200)}`);
-  }
-
-  let js;
-  try { js = JSON.parse(text || '{}'); } catch (e) {
-    console.error('TOKEN_JSON_ERROR', e, text);
-    throw new Error('TOKEN parse error');
-  }
-
-  const token = js.access_token;
-  if (!token) throw new Error('TOKEN missing access_token');
-
-  let exp = Date.now() + 9 * 60 * 1000;
-  if (js.access_token_token_expired) {
-    const t = new Date(js.access_token_token_expired).getTime();
-    if (Number.isFinite(t)) exp = t;
-  }
-  cachedToken = { token, exp };
-  return token;
-}
-
-async function kisGET(u, trid) {
-  const token = await getToken(); // 예외는 상위 try/catch에서 처리
-  const r = await fetch(u, {
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      accept: 'application/json',
-      authorization: `Bearer ${token}`,
-      appkey: process.env.KIS_APP_KEY,
-      appsecret: process.env.KIS_APP_SECRET,
-      tr_id: trid,
-      custtype: CUSTTYPE,
-    },
-  });
-  const body = await r.text().catch((e) => {
-    console.error('READ_BODY_ERROR', e);
-    return '';
-  });
-  if (!ok(r)) console.error('UPSTREAM_ERROR', r.status, body);
-  return { status: r.status, body };
-}
-
-// 재귀 탐색: 객체 내부에서 키를 찾아 첫 번째 값 반환
-function findField(obj, key) {
-  if (obj == null) return undefined;
-  if (typeof obj !== 'object') return undefined;
-  if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
-  for (const k of Object.keys(obj)) {
-    const v = obj[k];
-    if (v && typeof v === 'object') {
-      const found = findField(v, key);
-      if (found !== undefined) return found;
-    }
-  }
-  return undefined;
-}
-
-// 날짜 포맷 YYYYMMDD 생성 (UTC 기준으로 단순 역산)
-function makeDates(days) {
-  const dates = [];
-  const now = new Date();
-  for (let i = 0; i < days; i++) {
-    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-    d.setUTCDate(d.getUTCDate() - i);
-    const s = d.toISOString().slice(0,10).replace(/-/g,''); // YYYYMMDD
-    dates.push(s);
-  }
-  return dates;
-}
-
-module.exports = async (req, res) => {
-  if (req.method === 'OPTIONS') { headersCORS(res); return res.status(204).end(); }
-  headersCORS(res);
-
-  try {
-    const url = new URL(req.url, 'http://local');
-    const pathname = url.pathname.replace(/^\/api\/?/, '');
-
-    // 1) 헬스체크는 무인증
-    if (pathname === 'health') return res.status(200).send('ok');
-
-    // 2) API Key 검사
-    const apiKey = (req.headers['x-api-key'] || '').toString();
-    if (!process.env.PROXY_API_KEY || apiKey !== process.env.PROXY_API_KEY) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    // 3) 환경변수 필수 검사
-    assertEnv();
-
-    // 4) 라우팅
-    if (pathname === 'price') {
-      const code = url.searchParams.get('code') || '';
-      const mkt  = url.searchParams.get('mkt') || 'J';
-      const u = `${BASE}${PATH.PRICE}?${toQS({ FID_COND_MRKT_DIV_CODE: mkt, FID_INPUT_ISCD: code })}`;
-      const { status, body } = await kisGET(u, TRID.PRICE);
-      return res.status(status).send(body);
-    }
-
-    // --- New: series endpoint for extracting a field across recent days
-    // Usage: /api/series?code=005930&days=5&field=frgn_shnu_vol
-    if (pathname === 'series') {
-      const code = url.searchParams.get('code') || '';
-      const days = Math.min( Number(url.searchParams.get('days') || 5) || 5, 60 ); // max 60 to avoid long loops
-      const field = url.searchParams.get('field') || 'frgn_shnu_vol';
-
-      if (!code) return res.status(400).json({ error: 'code is required' });
-
-      const dates = makeDates(days);
-      const out = [];
-
-      for (const d of dates) {
-        const u = `${BASE}${PATH.INVEST}?${toQS({
-          FID_COND_MRKT_DIV_CODE: 'J',
-          FID_INPUT_ISCD: code,
-          FID_INPUT_DATE_1: d,
-          FID_ORG_ADJ_PRC: '',
-          FID_ETC_CLS_CODE: '',
-        })}`;
-
-        // upstream 요청
-        const { status, body } = await kisGET(u, TRID.INVEST);
-
-        // 로그 남기기(디버그 목적). 필요 없으면 제거하세요.
+      // descend into children
+      for (const k of Object.keys(x)) {
         try {
-          console.log('SERIES_UPSTREAM_URL', u);
-          console.log('SERIES_UPSTREAM_STATUS', status);
+          const v = x[k];
+          if (v && typeof v === 'object') {
+            const f = dfs(v);
+            if (f !== undefined) return f;
+          }
         } catch (e) { /* ignore */ }
-
-        let parsed = null;
-        try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = null; }
-
-        const value = parsed ? findField(parsed, field) : undefined;
-
-        out.push({ date: d, status, value: (value !== undefined ? value : null) });
       }
-
-      return res.status(200).json({ code, field, series: out });
+      return undefined;
     }
-
-    if (pathname === 'investor') {
-      const code = url.searchParams.get('code') || '';
-      // 날짜 포맷 정규화: 허용되는 형식(YYYYMMDD)으로 자동 변환
-      const rawDate = url.searchParams.get('date') || '';
-      const date = rawDate.replace(/-/g, '');
-
-      const u = `${BASE}${PATH.INVEST}?${toQS({
-        FID_COND_MRKT_DIV_CODE: 'J',
-        FID_INPUT_ISCD: code,
-        FID_INPUT_DATE_1: date,
-        FID_ORG_ADJ_PRC: '',
-        FID_ETC_CLS_CODE: '',
-      })}`;
-
-      const { status, body } = await kisGET(u, TRID.INVEST);
-
-      // --- Debug logs: 업스트림 URL / 상태 / 바디 일부를 남깁니다.
-      // 나중에 문제 해결되면 이 로그는 제거하세요 (민감정보 노출 주의)
-      try {
-        console.log('INVEST_UPSTREAM_URL', u);
-        console.log('INVEST_UPSTREAM_STATUS', status);
-        console.log('INVEST_UPSTREAM_BODY', (body && body.slice) ? body.slice(0, 1000) : body);
-      } catch (e) {
-        console.error('INVEST_LOG_ERROR', e && e.message ? e.message : e);
-      }
-
-      return res.status(status).send(body);
-    }
-
-    if (pathname === 'balance') {
-      const q = {
-        CANO: url.searchParams.get('cano') || '',
-        ACNT_PRDT_CD: url.searchParams.get('prdt') || '',
-        AFHR_FLPR_YN: url.searchParams.get('afhr') || 'N',
-        OFL_YN: '',
-        INQR_DVSN: url.searchParams.get('inqr') || '02',
-        UNPR_DVSN: url.searchParams.get('unpr') || '01',
-        FUND_STTL_ICLD_YN: url.searchParams.get('fund') || 'N',
-        FNCG_AMT_AUTO_RDPT_YN: url.searchParams.get('auto') || 'N',
-        PRCS_DVSN: url.searchParams.get('prcs') || '00',
-        CTX_AREA_FK100: url.searchParams.get('fk') || '',
-        CTX_AREA_NK100: url.searchParams.get('nk') || '',
-      };
-      const u = `${BASE}${PATH.BAL}?${toQS(q)}`;
-      const { status, body } = await kisGET(u, TRID.BAL);
-      return res.status(status).send(body);
-    }
-
-    return res.status(404).json({ error: 'Not Found' });
-  } catch (e) {
-    console.error('SERVER_ERROR', e);
-    return res.status(502).json({ error: String(e && e.message ? e.message : e) });
+    return dfs(obj);
   }
-};
+
+  const dates = makeDates(days);
+  const out = [];
+
+  for (const d of dates) {
+    const u = `${BASE}${PATH.INVEST}?${toQS({
+      FID_COND_MRKT_DIV_CODE: 'J',
+      FID_INPUT_ISCD: code,
+      FID_INPUT_DATE_1: d,
+      FID_ORG_ADJ_PRC: '',
+      FID_ETC_CLS_CODE: '',
+    })}`;
+
+    const { status, body } = await kisGET(u, TRID.INVEST);
+
+    // **디버그: 업스트림 body도 남깁니다 (나중에 제거)**
+    try {
+      console.log('SERIES_UPSTREAM_URL', u);
+      console.log('SERIES_UPSTREAM_STATUS', status);
+      console.log('SERIES_UPSTREAM_BODY', (body && body.slice) ? body.slice(0, 4000) : body);
+    } catch (e) { /* ignore */ }
+
+    let parsed = null;
+    try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = null; }
+
+    // robust search
+    let value = parsed ? findFieldRobust(parsed, field) : undefined;
+
+    // 값이 문자열이고 숫자 형식(콤마 포함)이라면 숫자로 변환 시도
+    if (value != null && typeof value === 'string') {
+      const num = Number(value.replace(/[, ]+/g, ''));
+      if (!Number.isNaN(num)) value = num;
+    }
+
+    out.push({ date: d, status, value: (value !== undefined ? value : null) });
+  }
+
+  return res.status(200).json({ code, field, series: out });
+}
