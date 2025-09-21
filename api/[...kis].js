@@ -78,22 +78,23 @@ async function getToken() {
 }
 
 async function kisGET(u, trid) {
-  const token = await getToken(); // 예외는 상위 try/catch에서 처리
+  const token = await getToken();
   const r = await fetch(u, {
+    method: 'GET',
     headers: {
       'content-type': 'application/json; charset=utf-8',
-      accept: 'application/json',
-      authorization: `Bearer ${token}`,
-      appkey: process.env.KIS_APP_KEY,
-      appsecret: process.env.KIS_APP_SECRET,
-      tr_id: trid,
-      custtype: CUSTTYPE,
+      'accept': 'application/json',
+      'authorization': `Bearer ${token}`,
+      'appkey': process.env.KIS_APP_KEY,
+      'appsecret': process.env.KIS_APP_SECRET,
+      'tr_id': trid,
+      'custtype': CUSTTYPE,
+      // 추가 후보 (Apps Script와 더 유사하게)
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) KIS-Proxy/1.0',
+      'accept-language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
     },
   });
-  const body = await r.text().catch((e) => {
-    console.error('READ_BODY_ERROR', e);
-    return '';
-  });
+  const body = await r.text().catch(() => '');
   if (!ok(r)) console.error('UPSTREAM_ERROR', r.status, body);
   return { status: r.status, body };
 }
