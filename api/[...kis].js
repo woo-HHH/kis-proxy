@@ -128,6 +128,16 @@ function ymdMinus(ymd, k) {
   return dt.toISOString().slice(0,10).replace(/-/g,'');
 }
 
+// 객체에서 대소문자 무시 키 찾기
+function getCaseInsensitive(obj, key) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  const target = String(key).toLowerCase();
+  for (const k of Object.keys(obj)) {
+    if (k.toLowerCase() === target) return obj[k];
+  }
+  return undefined;
+}
+
 module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') { headersCORS(res); return res.status(204).end(); }
   headersCORS(res);
@@ -157,12 +167,14 @@ module.exports = async (req, res) => {
       return res.status(status).send(body);
     }
 
-    // --- series endpoint (Apps Script style): 한 번 호출 → output2에서 상위 N개 추출
-    // Usage: /api/series?code=005930&days=5&field=frgn_shnu_vol
+    // --- series endpoint (Apps Script style): 한 번 호출 → 배열에서 상위 N개 추출
+    // Usage: /api/series?code=005930&days=5&field=frgn_shnu_vol[&date=YYYYMMDD][&debug=1]
     if (pathname === 'series') {
       const code = (url.searchParams.get('code') || '').trim();
       const days = Math.min(Number(url.searchParams.get('days') || 5) || 5, 60); // 1~60
       const fieldRaw = (url.searchParams.get('field') || 'frgn_shnu_vol').trim();
+      const overrideDate = (url.searchParams.get('date') || '').replace(/-/g,'').trim();
+      const debug = url.searchParams.get('debug') === '1';
       if (!code) return res.status(400).json({ error: 'code is required' });
 
       // 약어 별칭
@@ -176,7 +188,7 @@ module.exports = async (req, res) => {
       };
       const field = FIELD_ALIAS[fieldRaw.toLowerCase()] || fieldRaw;
 
-      async function fetchOutput2(ymd) {
+      async function fetchAnyArray(ymd) {
         const qs = toQS({
           FID_COND_MRKT_DIV_CODE: 'J',
           FID_INPUT_ISCD: code,
@@ -186,40 +198,59 @@ module.exports = async (req, res) => {
         });
         const u = `${BASE}${PATH.INVEST}?${qs}`;
         const { status, body } = await kisGET(u, TRID.INVEST);
-        console.log('SERIES_ONECALL_URL', u);
-        console.log('SERIES_ONECALL_STATUS', status);
         let js = null;
         try { js = JSON.parse(body || '{}'); } catch (_) { js = null; }
-        const out2 = js && Array.isArray(js.output2) ? js.output2 : [];
-        return { out2 };
+        // output2 → output → output1 순서로 배열 찾기
+        let arr = [];
+        if (js) {
+          if (Array.isArray(js.output2)) arr = js.output2;
+          else if (Array.isArray(js.output)) arr = js.output;
+          else if (Array.isArray(js.output1)) arr = js.output1;
+        }
+        if (debug) {
+          console.log('SERIES_ONECALL_URL', u);
+          console.log('SERIES_ONECALL_STATUS', status);
+          console.log('SERIES_ONECALL_LEN', Array.isArray(arr) ? arr.length : 0);
+          try { console.log('SERIES_ONECALL_BODY', (body && body.slice) ? body.slice(0, 1200) : body); } catch {}
+        }
+        return { arr, raw: body };
       }
 
-      // 1) 오늘(서울) 기준 1회 호출 → 없으면 최대 7일 과거 보정
-      let usedYmd = todaySeoulYMD();
-      let { out2 } = await fetchOutput2(usedYmd);
-      for (let i = 1; i <= 7 && (!out2 || out2.length === 0); i++) {
+      // 1) 기준일 결정: override > 오늘(서울)
+      let usedYmd = overrideDate || todaySeoulYMD();
+      let { arr } = await fetchAnyArray(usedYmd);
+
+      // 2) 없으면 최대 7일 과거 보정
+      for (let i = 1; i <= 7 && (!arr || arr.length === 0); i++) {
         usedYmd = ymdMinus(usedYmd, 1);
-        ({ out2 } = await fetchOutput2(usedYmd));
+        ({ arr } = await fetchAnyArray(usedYmd));
       }
 
-      const arr = Array.isArray(out2) ? out2.slice() : [];
-      // 최신(영업일) 내림차순 정렬
-      arr.sort((a,b)=> String(b.stck_bsop_date||'').localeCompare(String(a.stck_bsop_date||'')));
+      // 3) 최신(영업일) 내림차순 정렬
+      const rows = Array.isArray(arr) ? arr.slice() : [];
+      rows.sort((a,b)=> String((b && b.stck_bsop_date) || '').localeCompare(String((a && a.stck_bsop_date) || '')));
 
+      // 4) 대소문자 무시로 필드 추출 + 숫자화
+      const keyLower = field.toLowerCase();
       const toNum = (v) => {
         if (v == null || v === '') return null;
-        const n = Number(String(v).replace(/,/g,''));
+        const n = Number(String(v).replace(/[, ]+/g,''));
         return Number.isFinite(n) ? n : null;
-      };
+        };
+      const sliced = rows.slice(0, days);
+      const series = sliced.map(row => {
+        if (!row || typeof row !== 'object') return { date: '', status: 200, value: null };
+        const date = String(row.stck_bsop_date || row.STCK_BSOP_DATE || '');
+        // 필드 이름 대소문자 무시
+        let rawVal = getCaseInsensitive(row, field);
+        if (rawVal === undefined) {
+          // 흔한 대문자 스키마 방어
+          rawVal = getCaseInsensitive(row, keyLower.toUpperCase());
+        }
+        return { date, status: 200, value: toNum(rawVal) };
+      });
 
-      const sliced = arr.slice(0, days);
-      const series = sliced.map(row => ({
-        date: String(row.stck_bsop_date || ''),
-        status: 200,
-        value: toNum(row[field]),
-      }));
-
-      return res.status(200).json({ code, field, series });
+      return res.status(200).json({ code, field, usedYmd, series });
     }
 
     if (pathname === 'investor') {
