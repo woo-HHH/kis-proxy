@@ -13,22 +13,30 @@ module.exports = async (req, res) => {
   headersCORS(res);
 
   try {
-    // 1) 반드시 /exec ‘베이스’ URL만 환경변수에 넣어둡니다 (쿼리 없이)
-    //    예: https://script.google.com/macros/s/AKfycbzCnWwico_cqQzr2NnSDExG0VklGfq7oym4idt0l0uXB-eRzhl9FhX87A9lWzFEiCOk/exec
+    // 반드시 쿼리 없는 /exec 베이스 URL만!
     const BASE = process.env.GAS_EXEC_URL;
     if (!BASE) return res.status(500).json({ error: 'Missing GAS_EXEC_URL' });
 
     const url = new URL(req.url, 'http://local');
-    const op    = url.searchParams.get('op')    || 'series';
-    const code  = url.searchParams.get('code')  || '';
-    const days  = url.searchParams.get('days')  || '';
-    const field = url.searchParams.get('field') || '';
-    const key   = url.searchParams.get('key')   || '';
+    const op    = (url.searchParams.get('op') || 'series').trim();
+    const code  = (url.searchParams.get('code') || '').trim();
+    const days  = (url.searchParams.get('days') || '').trim();
+    const field = (url.searchParams.get('field') || '').trim();
+    const key   = (url.searchParams.get('key') || '').trim();
+
+    // Vercel 측 ping (프록시 자체 진단)
+    if (op === 'ping') {
+      return res.status(200).json({
+        proxy: 'ok',
+        has_GAS_EXEC_URL: !!BASE,
+        forward_example: `${BASE}?op=series&code=005930&days=5&field=fb&key=YOUR_KEY`
+      });
+    }
 
     if (!code) return res.status(400).json({ error: 'code is required' });
     if (!key)  return res.status(400).json({ error: 'key is required' });
 
-    // 2) GAS /exec 로 그대로 전달 (리다이렉트 follow)
+    // GAS /exec 로 그대로 전달 (302 follow)
     const tgt = new URL(BASE);
     tgt.searchParams.set('op', op);
     tgt.searchParams.set('code', code);
@@ -37,15 +45,12 @@ module.exports = async (req, res) => {
     tgt.searchParams.set('key', key);
 
     const r = await fetch(tgt.toString(), { redirect: 'follow' });
-    const text = await r.text().catch(()=>'');
+    const text = await r.text().catch(() => '');
 
-    // 3) 그대로 전달
     res.status(r.status);
-    // GAS는 JSON을 text/plain으로 줄 때도 있어 content-type 강제
     res.setHeader('content-type', 'application/json; charset=utf-8');
 
     if (!ok(r)) {
-      // 문제 파악용 로그(원하면 제거 가능)
       console.error('GAS_PROXY_UPSTREAM', r.status, text.slice(0, 500));
     }
     return res.send(text);
