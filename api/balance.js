@@ -20,19 +20,20 @@ export default async function handler(req, res) {
     }
 
     // 2) 잔고 조회
-    const trId = process.env.KIS_TR_ID_VT || "VTTC8434R"; // 모의투자 기준
-    const params = new URLSearchParams({
-      CANO: process.env.KIS_CANO,
-      ACNT_PRDT_CD: process.env.KIS_ACNT_PRDT_CD,
-      AFHR_FLPR_YN: "N",
-      INQR_DVSN: "02",
-      UNPR_DVSN: "01",
-      FUND_STTL_ICLD_YN: "N",
-      FNCG_AMT_AUTO_RDPT_YN: "N",
-      PRCS_DVSN: "01",
-      CTX_AREA_FK100: "",
-      CTX_AREA_NK100: ""
-    });
+const params = new URLSearchParams({
+  CANO: process.env.KIS_CANO,
+  ACNT_PRDT_CD: process.env.KIS_ACNT_PRDT_CD,
+  AFHR_FLPR_YN: "N",
+  OFL_YN: "N",              // 🔴 누락되어 있던 필수 파라미터 추가
+  INQR_DVSN: "02",
+  UNPR_DVSN: "01",
+  FUND_STTL_ICLD_YN: "N",
+  FNCG_AMT_AUTO_RDPT_YN: "N",
+  PRCS_DVSN: "01",
+  CTX_AREA_FK100: "",
+  CTX_AREA_NK100: ""
+});
+
 
     const balanceRes = await fetch(
       `${BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance?${params.toString()}`,
